@@ -15,7 +15,7 @@ jobs:
 
     # 2. بناء وتشغيل الحاويات (API, Cache, Worker) على سيرفر جيتهاب
     - name: 🐳 Start Docker Compose
-      run: docker-compose up --build -d
+      run: docker compose up --build -d
 
     # 3. إعطاء النظام 5 ثواني عشان يشتغل براحته قبل الفحص
     - name: ⏳ Wait for services
@@ -23,7 +23,7 @@ jobs:
 
     # 4. تشغيل الفحص الآلي من جوا الحاوية (حرف T ضروري عشان جيتهاب ما يعلق)
     - name: 🧪 Run Pytest inside Docker
-      run: docker-compose exec -T api pytest
+      run: docker compose exec -T api pytest
         
     # 5. رسالة نجاح
     - name: ✅ Success Message
