@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  # الخدمة الأولى: كود البايثون تبعك
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - cache
+
+  # الخدمة الثانية: خادم الذاكرة المؤقتة (مكتب الاستقبال)
+  cache:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+# الخدمة الجديدة (الطباخ)
+  worker:
+    build: .
+    command: celery -A worker.celery_app worker --loglevel=info
+    depends_on:
+      - cache
+      - api

@@ -1,3 +1,10 @@
+
+
+
+
+
+
+
 from fastapi import FastAPI, Depends ,HTTPException, status
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -6,6 +13,13 @@ from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import jwt
 from datetime import datetime, timedelta, timezone
+from worker import process_heavy_video
+
+import redis
+import json
+
+# الاتصال بمكتب الاستقبال (لاحظ إن اسم الهوست هو نفس اسم الخدمة بملف الدوكر كومبوز)
+redis_client = redis.Redis(host='cache', port=6379, db=0, decode_responses=True)
 
 
 # إعداد قاعدة البيانات 
@@ -128,14 +142,16 @@ app = FastAPI()
 
 @app.post("/login/")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    # 1. البحث عن المستخدم في قاعدة البيانات
     user = db.query(User).filter(User.username == form_data.username).first()
     
-    # 2. التأكد من وجود المستخدم ومن صحة الباسورد
+    # التعديل صار هون: صرنا نرفع Exception (401) بدل ما نرجع return عادية
     if not user or not verify_password(form_data.password, user.hashed_password):
-        return {"error": "اسم المستخدم أو كلمة المرور غير صحيحة"}
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="اسم المستخدم أو كلمة المرور غير صحيحة",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
-    # 3. إصدار الـ JWT Token إذا كانت المعلومات صحيحة
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -150,6 +166,26 @@ def create_series(series: SeriesCreate, db: Session = Depends(get_db), current_u
     # رسالة ترحيبية بتثبت إن السيرفر عرف مين اللي ضاف المسلسل!
     return {"message": f"تمت الإضافة بواسطة: {current_user.username}", "series": db_series}
 
+@app.get("/test-episodes/{series_id}")
+def get_episodes(series_id: int):
+    # 1. أولاً: نفحص مكتب الاستقبال (Redis)
+    cached_data = redis_client.get(f"series_{series_id}_episodes")
+    if cached_data:
+        # إذا لقيناها بالذاكرة، بنرجعها فوراً مع علامة البرق
+        return {"source": "Redis Cache ⚡", "data": json.loads(cached_data)}
+    
+    # 2. ثانياً: إذا مش موجودة، بنجيبها من المستودع (محاكاة لقاعدة البيانات)
+    # هون المفروض يكون كود الاستعلام من الداتابيس تبعتك
+    episodes_from_db = [
+        {"episode_number": 1, "title": "الحلقة الأولى"},
+        {"episode_number": 2, "title": "الحلقة الثانية"}
+    ]
+    
+    # 3. ثالثاً: ننسخ البيانات ونحطها بمكتب الاستقبال للمرات الجاية (لمدة 60 ثانية)
+    redis_client.setex(f"series_{series_id}_episodes", 60, json.dumps(episodes_from_db))
+    
+    # نرجع البيانات مع علامة الداتابيس
+    return {"source": "Database 🗄️", "data": episodes_from_db}
 
 @app.post("/episodes/")
 def create_episode(episode: EpisodeCreate, db: Session = Depends(get_db),current_user:User=Depends(get_current_admin)):
@@ -159,9 +195,18 @@ def create_episode(episode: EpisodeCreate, db: Session = Depends(get_db),current
     db.refresh(db_episode)
     return db_episode
 
-@app.get("/episodes/")
-def get_episodes(db: Session = Depends(get_db)):
-    return db.query(Episode).all()
+# ضفنا {series_id} في الرابط عشان نستلم الرقم
+@app.get("/episodes/{series_id}")
+def get_episodes_by_series(series_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # بنفلتر الحلقات بناءً على رقم المسلسل
+    episodes = db.query(Episode).filter(Episode.series_id == series_id).all()
+    return episodes
+
+
+# API لعرض كل المسلسلات
+@app.get("/series/")
+def get_all_series(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return db.query(Series).all()
 
 @app.post("/register/")
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -181,21 +226,23 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
     
     return {"message": "تم إنشاء الحساب بنجاح", "user_id": new_user.id}
 
+
+# API لتعديل اسم مسلسل موجود (PUT)
 # API لتعديل اسم مسلسل موجود (PUT)
 @app.put("/series/{series_id}")
-def update_series(series_id: int, series_update: SeriesCreate, db: Session = Depends(get_db),current_user: User =Depends(get_current_admin)):
-    # 1. البحث عن المسلسل في قاعدة البيانات (زي جملة SELECT ... WHERE id =)
-    db_series = db.query(Series).filter(Series.id == series_id).first()
+def update_series(series_id: int, new_data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # 1. نبحث عن المسلسل برقم الـ ID
+    series = db.query(Series).filter(Series.id == series_id).first()
     
-    # 2. التأكد إذا كان المسلسل موجود أصلاً
-    if not db_series:
-        return {"error": "المسلسل غير موجود!"}
+    # 2. إذا ما لقيناه بنرجع خطأ
+    if not series:
+        raise HTTPException(status_code=404, detail="المسلسل غير موجود")
     
-    # 3. تعديل البيانات وحفظها
-    db_series.title = series_update.title
+    # 3. إذا لقيناه، بنعدل اسمه للاسم الجديد اللي وصلنا
+    series.title = new_data.get("title", series.title)
     db.commit()
-    db.refresh(db_series)
-    return {"message": "تم التعديل بنجاح", "updated_series": db_series}
+    db.refresh(series)
+    return {"message": "تم التعديل بنجاح", "series": series}
 
 
 # API لحذف مسلسل (DELETE)
@@ -212,3 +259,13 @@ def delete_series(series_id: int, db: Session = Depends(get_db),currnet_user:Use
     db.delete(db_series)
     db.commit()
     return {"message": f"تم حذف المسلسل رقم {series_id} بنجاح"}
+
+
+# ضيف هذا المسار تحت
+@app.post("/start-video-processing/{video_name}")
+def start_processing(video_name: str):
+    # السحر هون: كلمة delay بتخلي المهمة تروح للخلفية فوراً
+    process_heavy_video.delay(video_name)
+    
+    # السيرفر بيرد فوراً بدون ما يستنى الـ 10 ثواني!
+    return {"message": f"تم استلام فيديو '{video_name}' وجاري المعالجة في الخلفية!"}
