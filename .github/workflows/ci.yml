@@ -29,3 +29,7 @@ jobs:
     # 4. رسالة نجاح
     - name: ✅ Success Message
       run: echo "تم فحص الكود بنجاح يا هندسة! النظام جاهز للعمل."
+      # 5. تشغيل الفحص الآلي
+    - name: 🧪 Run Pytest
+      run: |
+        python -m pytest
